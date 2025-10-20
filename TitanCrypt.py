@@ -19,7 +19,7 @@ def generate_random_key(length=25):
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return ''.join(random.choices(chars, k=length))
 
-def xor_encrypt( bytes, key: bytes) -> bytes:
+def xor_encrypt(data: bytes, key: bytes) -> bytes:
     """XOR encrypt data with key"""
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
@@ -86,7 +86,7 @@ def encode_image_to_files(img: Image.Image, key: str) -> (bytes, bytes):
     shuffled_img.save(img_buffer, format="PNG")
     shuffled_img_bytes = img_buffer.getvalue()
     
-    # Create decryption key data: width, height, and shuffle mapping
+    # Create decryption key  width, height, and shuffle mapping
     mapping_str = f"{width}:{height}:" + ','.join(map(str, shuffle_indices))
     key_bytes = mapping_str.encode('utf-8')
     
@@ -126,18 +126,82 @@ def decode_files_to_image(shuffled_img_bytes: bytes, encrypted_key_bytes: bytes,
     original_img = restore_original_image(shuffled_img, shuffle_indices)
     return original_img, width, height
 
+def text_encrypt(plain_text: str, key: str) -> str:
+    """Encrypt text using XOR and ensure output is valid hex"""
+    if not plain_text or not key:
+        return ""
+    
+    # Convert text to bytes (UTF-8 to handle diacritics)
+    text_bytes = plain_text.encode('utf-8')
+    key_bytes = key.encode('utf-8')
+    
+    # XOR encrypt
+    encrypted_bytes = xor_encrypt(text_bytes, key_bytes)
+    
+    # Convert to hex string (this is valid hex)
+    hex_string = encrypted_bytes.hex()
+    
+    # Store the original length information in the hex string itself
+    # We'll prepend the original byte length as 4 hex digits
+    original_byte_length = len(text_bytes)
+    length_hex = f"{original_byte_length:04x}"
+    
+    # Combine length info with encrypted data
+    full_hex = length_hex + hex_string
+    
+    return full_hex
+
+def text_decrypt(encrypted_text: str, key: str) -> str:
+    """Decrypt text from hex string"""
+    if not encrypted_text or not key:
+        return ""
+    
+    try:
+        # Validate that the encrypted text contains only hex characters
+        if not re.match(r'^[0-9a-fA-F]+$', encrypted_text):
+            raise ValueError("Neplatný zašifrovaný text - obsahuje nehexadecimálne znaky")
+        
+        # Extract original byte length (first 4 hex chars = 2 bytes)
+        if len(encrypted_text) < 4:
+            raise ValueError("Neplatný zašifrovaný text - chýba informácia o dĺžke")
+            
+        length_hex = encrypted_text[:4]
+        original_byte_length = int(length_hex, 16)
+        encrypted_hex = encrypted_text[4:]
+        
+        # Convert hex string back to bytes
+        encrypted_bytes = bytes.fromhex(encrypted_hex)
+        
+        # Truncate to original length if needed (padding might have been added)
+        if len(encrypted_bytes) > original_byte_length:
+            encrypted_bytes = encrypted_bytes[:original_byte_length]
+        elif len(encrypted_bytes) < original_byte_length:
+            # Pad with zeros if somehow shorter (shouldn't happen)
+            encrypted_bytes = encrypted_bytes.ljust(original_byte_length, b'\x00')
+        
+        key_bytes = key.encode('utf-8')
+        
+        # XOR decrypt
+        decrypted_bytes = xor_encrypt(encrypted_bytes, key_bytes)
+        
+        # Convert back to string
+        return decrypted_bytes.decode('utf-8')
+    except Exception as e:
+        raise ValueError(f"Chyba pri dešifrovaní textu: {e}")
+
 INDEX_HTML = """
 <!doctype html>
 <html lang="sk">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Image ↔ EncryptedText (Pixel Shuffle)</title>
+  <title>ImgCrypt & TextCrypt</title>
   <style>
     body { font-family: Arial, sans-serif; background:#0f1220; color:#eaf0ff; padding:20px; }
     .card { background:#151823; padding:16px; border-radius:10px; border:1px solid #2b3440; max-width:900px; margin:0 auto; }
     label { display:block; margin-top:12px; color:#aab6d1; }
-    input[type=text] { width:100%; padding:8px; border-radius:6px; background:#0e1117; border:1px solid #26303b; color:#eaf0ff; }
+    input[type=text], textarea { width:100%; padding:8px; border-radius:6px; background:#0e1117; border:1px solid #26303b; color:#eaf0ff; }
+    textarea { min-height:100px; resize:vertical; }
     .row { display:flex; gap:8px; margin-top:10px; align-items:end; }
     .row > * { flex:1; }
     button { padding:8px 10px; border-radius:6px; border:none; background:#2e8b57; color:white; cursor:pointer; }
@@ -204,11 +268,20 @@ INDEX_HTML = """
     .error-icon {
       font-weight: bold;
     }
+    .section { margin-top: 24px; border-top: 1px solid #28313e; padding-top: 24px; }
+    .copy-text-btn {
+      background:#4a5568;
+      padding:6px 10px;
+      border-radius:4px;
+      cursor:pointer;
+      font-size:0.9rem;
+      margin-top:8px;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Obrázok → Šifrovaný súbor (Pixel Shuffle) / Šifrovaný súbor → Obrázok</h2>
+    <h2>ImgCrypt</h2>
 
     <h3>1) Šifrovanie obrázka → súbory</h3>
     <form method="post" action="/encrypt" enctype="multipart/form-data" id="encryptForm">
@@ -286,19 +359,107 @@ INDEX_HTML = """
     {% endwith %}
   </div>
 
+  <div class="card section">
+    <h2>TextCrypt</h2>
+    
+    <form method="post" action="/text_encrypt" id="textEncryptForm">
+      <label>Kľúč (A–Z, 0–9; presne 25 znakov):</label>
+      <div class="key-input-container">
+        <input type="text" id="text-key" name="key" placeholder="Napr. ABC12..." required
+               oninput="validateTextKey(this)" maxlength="29">
+        <div class="key-buttons">
+          <button type="button" class="dice-btn" onclick="generateTextRandomKey()">🎲</button>
+          <button class="copy-btn" type="button" onclick="copyTextKey()" style="padding:6px;font-size:0.8rem;background:#4a5568;">📋 Kopírovať</button>
+        </div>
+      </div>
+      <div class="error-message" id="text-key-error">
+        <span class="error-icon">!</span>
+        <span>Kľúč musí obsahovať presne 25 znakov (A-Z, 0-9)</span>
+      </div>
+      
+      <label>Text na zašifrovanie (podporuje diakritiku):</label>
+      <textarea id="plain-text" name="plain_text" placeholder="Zadaj text na zašifrovanie..." required></textarea>
+      
+      <button class="small" type="submit" style="margin-top:12px;">Zašifrovať text</button>
+    </form>
+
+    {% if encrypted_text %}
+      <hr style="margin-top:16px; border-color:#28313e">
+      <h3>Zašifrovaný text:</h3>
+      <textarea id="encrypted-text-display" readonly>{{ encrypted_text }}</textarea>
+      <button class="copy-text-btn" onclick="copyEncryptedText()">📋 Kopírovať zašifrovaný text</button>
+      <div class="note" style="margin-top:8px;">
+        Dĺžka pôvodného textu: {{ original_length }} znakov | 
+        Dĺžka zašifrovaného textu: {{ encrypted_length }} znakov
+      </div>
+    {% endif %}
+    
+    <hr style="margin-top:24px; border-color:#28313e">
+    
+    <form method="post" action="/text_decrypt" id="textDecryptForm">
+      <label>Kľúč (A–Z, 0–9; presne 25 znakov):</label>
+      <div class="key-input-container">
+        <input type="text" id="decrypt-text-key" name="key" placeholder="Napr. ABC12..." required
+               oninput="validateDecryptTextKey(this)" maxlength="29">
+        <div class="key-buttons">
+          <button class="copy-btn" type="button" onclick="copyDecryptTextKey()" style="padding:6px;font-size:0.8rem;background:#4a5568;">📋 Kopírovať</button>
+        </div>
+      </div>
+      <div class="error-message" id="decrypt-text-key-error">
+        <span class="error-icon">!</span>
+        <span>Kľúč musí obsahovať presne 25 znakov (A-Z, 0-9)</span>
+      </div>
+      
+      <label>Zašifrovaný text na dešifrovanie:</label>
+      <textarea id="encrypted-text-input" name="encrypted_text" placeholder="Vlož zašifrovaný text na dešifrovanie..." required></textarea>
+      
+      <button class="small" type="submit" style="margin-top:12px; background:#8b5cf6;">Dešifrovať text</button>
+    </form>
+
+    {% if decrypted_text %}
+      <hr style="margin-top:16px; border-color:#28313e">
+      <h3>Dešifrovaný text:</h3>
+      <textarea id="decrypted-text-display" readonly>{{ decrypted_text }}</textarea>
+      <button class="copy-text-btn" onclick="copyDecryptedText()">📋 Kopírovať dešifrovaný text</button>
+    {% endif %}
+  </div>
+
   <script>
     function formatKey(input) {
       let value = input.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
       if (value.length > 25) value = value.substring(0, 25);
       let formatted = value.match(/.{1,5}/g)?.join('-') || '';
       input.value = formatted;
-      validateKey(input);
     }
     
     function validateKey(input) {
       const cleanValue = input.value.replace(/-/g, '');
       const errorId = input.id === 'encrypt-key' ? 'key-error' : 'decrypt-key-error';
       const errorElement = document.getElementById(errorId);
+      if (cleanValue.length !== 25) {
+        errorElement.style.display = 'flex';
+        input.setCustomValidity('Kľúč musí mať presne 25 znakov');
+      } else {
+        errorElement.style.display = 'none';
+        input.setCustomValidity('');
+      }
+    }
+    
+    function validateTextKey(input) {
+      const cleanValue = input.value.replace(/-/g, '');
+      const errorElement = document.getElementById('text-key-error');
+      if (cleanValue.length !== 25) {
+        errorElement.style.display = 'flex';
+        input.setCustomValidity('Kľúč musí mať presne 25 znakov');
+      } else {
+        errorElement.style.display = 'none';
+        input.setCustomValidity('');
+      }
+    }
+    
+    function validateDecryptTextKey(input) {
+      const cleanValue = input.value.replace(/-/g, '');
+      const errorElement = document.getElementById('decrypt-text-key-error');
       if (cleanValue.length !== 25) {
         errorElement.style.display = 'flex';
         input.setCustomValidity('Kľúč musí mať presne 25 znakov');
@@ -318,6 +479,16 @@ INDEX_HTML = """
       validateKey(document.getElementById('encrypt-key'));
     }
     
+    function generateTextRandomKey() {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let result = '';
+      for (let i = 0; i < 25; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      document.getElementById('text-key').value = result.match(/.{1,5}/g).join('-');
+      validateTextKey(document.getElementById('text-key'));
+    }
+    
     function copyEncryptionKey() {
       const keyInput = document.getElementById('encrypt-key');
       keyInput.select();
@@ -332,10 +503,41 @@ INDEX_HTML = """
       alert('Dešifrovací kľúč bol skopírovaný do schránky!');
     }
     
+    function copyTextKey() {
+      const keyInput = document.getElementById('text-key');
+      keyInput.select();
+      document.execCommand('copy');
+      alert('Textový kľúč bol skopírovaný do schránky!');
+    }
+    
+    function copyDecryptTextKey() {
+      const keyInput = document.getElementById('decrypt-text-key');
+      keyInput.select();
+      document.execCommand('copy');
+      alert('Dešifrovací textový kľúč bol skopírovaný do schránky!');
+    }
+    
+    function copyEncryptedText() {
+      const textArea = document.getElementById('encrypted-text-display');
+      textArea.select();
+      document.execCommand('copy');
+      alert('Zašifrovaný text bol skopírovaný do schránky!');
+    }
+    
+    function copyDecryptedText() {
+      const textArea = document.getElementById('decrypted-text-display');
+      textArea.select();
+      document.execCommand('copy');
+      alert('Dešifrovaný text bol skopírovaný do schránky!');
+    }
+    
     // Initialize validation on page load
     document.addEventListener('DOMContentLoaded', function() {
       const encryptKey = document.getElementById('encrypt-key');
       const decryptKey = document.getElementById('decrypt-key');
+      const textKey = document.getElementById('text-key');
+      const decryptTextKey = document.getElementById('decrypt-text-key');
+      
       if (encryptKey) {
         encryptKey.addEventListener('input', function() {
           formatKey(this);
@@ -343,6 +545,16 @@ INDEX_HTML = """
       }
       if (decryptKey) {
         decryptKey.addEventListener('input', function() {
+          formatKey(this);
+        });
+      }
+      if (textKey) {
+        textKey.addEventListener('input', function() {
+          formatKey(this);
+        });
+      }
+      if (decryptTextKey) {
+        decryptTextKey.addEventListener('input', function() {
           formatKey(this);
         });
       }
@@ -357,6 +569,10 @@ _encrypted_image_bytes = None
 _decryption_key_bytes = None
 _decrypted_image_buffer = None
 _decrypted_filename = None
+_encrypted_text = None
+_original_text_length = 0
+_encrypted_text_length = 0
+_decrypted_text = None
 
 @app.route("/", methods=["GET"])
 def index():
@@ -490,6 +706,68 @@ def download_decrypted():
         as_attachment=True,
         download_name=_decrypted_filename
     )
+
+@app.route("/text_encrypt", methods=["POST"])
+def text_encrypt_route():
+    global _encrypted_text, _original_text_length, _encrypted_text_length, _decrypted_text
+    # Clear decrypted text when encrypting
+    _decrypted_text = None
+    
+    plain_text = request.form.get('plain_text', '').strip()
+    key_raw = request.form.get('key', '')
+    key_clean = normalize_key_for_storage(key_raw)
+    
+    if len(key_clean) != 25:
+        flash("Kľúč musí obsahovať presne 25 znakov (iba A–Z, 0–9).")
+        return redirect(url_for('index'))
+    
+    if not plain_text:
+        flash("Zadaj text na zašifrovanie.")
+        return redirect(url_for('index'))
+    
+    try:
+        encrypted_text = text_encrypt(plain_text, key_clean)
+        _encrypted_text = encrypted_text
+        _original_text_length = len(plain_text)
+        _encrypted_text_length = len(encrypted_text)
+        return render_template_string(
+            INDEX_HTML,
+            encrypted_text=encrypted_text,
+            original_length=_original_text_length,
+            encrypted_length=_encrypted_text_length
+        )
+    except Exception as e:
+        flash(f"Chyba pri šifrovaní textu: {e}")
+        return redirect(url_for('index'))
+
+@app.route("/text_decrypt", methods=["POST"])
+def text_decrypt_route():
+    global _decrypted_text, _encrypted_text
+    # Clear encrypted text when decrypting
+    _encrypted_text = None
+    
+    encrypted_text = request.form.get('encrypted_text', '').strip()
+    key_raw = request.form.get('key', '')
+    key_clean = normalize_key_for_storage(key_raw)
+    
+    if len(key_clean) != 25:
+        flash("Kľúč musí obsahovať presne 25 znakov (iba A–Z, 0–9).")
+        return redirect(url_for('index'))
+    
+    if not encrypted_text:
+        flash("Zadaj zašifrovaný text na dešifrovanie.")
+        return redirect(url_for('index'))
+    
+    try:
+        decrypted_text = text_decrypt(encrypted_text, key_clean)
+        _decrypted_text = decrypted_text
+        return render_template_string(
+            INDEX_HTML,
+            decrypted_text=decrypted_text
+        )
+    except Exception as e:
+        flash(f"Chyba pri dešifrovaní textu: {e}")
+        return redirect(url_for('index'))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
