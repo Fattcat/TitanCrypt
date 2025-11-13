@@ -1070,7 +1070,7 @@ class ServerGUI:
 
         # === LOGO (naľavo) ===
         logo_frame = tk.Frame(self.root, bg="#0d0f1a")
-        logo_frame.pack(side="left", padx=(20, 10), pady=20)
+        logo_frame.pack(side="left", padx=(70,0), pady=10)
 
         self.logo_photo = None
 
@@ -1083,14 +1083,11 @@ class ServerGUI:
                 img = img.resize((128, 128), PILImage.LANCZOS)
                 # Vytvor obrázok s border-radius a borderom
                 bordered = PILImage.new("RGBA", (132, 132), (0, 0, 0, 0))
-                # Mask pre zaoblenie
-                mask = PILImage.new("L", (128, 128), 0)
-                ImageDraw.Draw(mask).ellipse((0, 0, 128, 128), fill=255)
-                img.putalpha(mask)
-                bordered.paste(img, (2, 2), mask)
+
+                bordered.paste(img, (2, 2))
                 # Pridaj červený border
                 draw = ImageDraw.Draw(bordered)
-                draw.ellipse((0, 0, 131, 131), outline=(255, 0, 0), width=2)
+                draw.rounded_rectangle((0, 0, 131, 131), radius=10, outline=(255,0,0), width=2)
                 self.logo_photo = ImageTk.PhotoImage(bordered)
             else:
                 raise FileNotFoundError("Logo neexistuje")
@@ -1101,7 +1098,7 @@ class ServerGUI:
                 from PIL import Image as PILImage, ImageTk, ImageDraw
                 img = PILImage.new("RGBA", (128, 128), (13, 15, 26, 255))
                 draw = ImageDraw.Draw(img)
-                draw.ellipse((8, 8, 120, 120), outline=(255, 0, 0), width=4)
+                draw.rectangle((8, 8, 120, 120), outline=(255, 0, 0), width=4)
                 # Použi bezpečný font (ak arial nie je, použi default)
                 try:
                     fallback_font = PILImage.ImageFont.truetype("arialbd.ttf", 64)
