@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from collections import defaultdict
+import base64
 
 # Tkinter import (iba ak bežíme ako GUI appka)
 USE_GUI = "--no-gui" not in sys.argv
@@ -1056,32 +1057,85 @@ class ServerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Titan Crypt Server")
-        self.root.geometry("480x240")
+        self.root.geometry("560x260")
         self.root.configure(bg="#0d0f1a")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # Centruj okno
         self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() // 2) - (480 // 2)
-        y = (self.root.winfo_screenheight() // 2) - (240 // 2)
-        self.root.geometry(f"480x240+{x}+{y}")
+        x = (self.root.winfo_screenwidth() // 2) - (560 // 2)
+        y = (self.root.winfo_screenheight() // 2) - (260 // 2)
+        self.root.geometry(f"560x260+{x}+{y}")
 
-        # Fonty
+        # === LOGO (naľavo) ===
+        logo_frame = tk.Frame(self.root, bg="#0d0f1a")
+        logo_frame.pack(side="left", padx=(20, 10), pady=20)
+
+        self.logo_photo = None
+
+        try:
+            # Použi PIL s unikátnymi menami (bez kolízií s tkinter.font)
+            from PIL import Image as PILImage, ImageTk, ImageDraw, ImageFont as PILFont
+            logo_path = Path("static") / "TitanCryptLogo2.png"
+            if logo_path.exists():
+                img = PILImage.open(logo_path).convert("RGBA")
+                img = img.resize((128, 128), PILImage.LANCZOS)
+                # Vytvor obrázok s border-radius a borderom
+                bordered = PILImage.new("RGBA", (132, 132), (0, 0, 0, 0))
+                # Mask pre zaoblenie
+                mask = PILImage.new("L", (128, 128), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, 128, 128), fill=255)
+                img.putalpha(mask)
+                bordered.paste(img, (2, 2), mask)
+                # Pridaj červený border
+                draw = ImageDraw.Draw(bordered)
+                draw.ellipse((0, 0, 131, 131), outline=(255, 0, 0), width=2)
+                self.logo_photo = ImageTk.PhotoImage(bordered)
+            else:
+                raise FileNotFoundError("Logo neexistuje")
+        except Exception as e:
+            print(f"[GUI] PNG logo sa nepodarilo načítať: {e}")
+            # Fallback: vytvor logo programovo
+            try:
+                from PIL import Image as PILImage, ImageTk, ImageDraw
+                img = PILImage.new("RGBA", (128, 128), (13, 15, 26, 255))
+                draw = ImageDraw.Draw(img)
+                draw.ellipse((8, 8, 120, 120), outline=(255, 0, 0), width=4)
+                # Použi bezpečný font (ak arial nie je, použi default)
+                try:
+                    fallback_font = PILImage.ImageFont.truetype("arialbd.ttf", 64)
+                except:
+                    fallback_font = None
+                draw.text((64, 36), "T", fill=(255, 0, 0), font=fallback_font, anchor="mm")
+                self.logo_photo = ImageTk.PhotoImage(img)
+            except Exception as e2:
+                print(f"[GUI] Fallback logo zlyhalo: {e2}")
+                self.logo_photo = None
+
+        if self.logo_photo:
+            logo_label = tk.Label(logo_frame, image=self.logo_photo, bg="#0d0f1a")
+            logo_label.pack()
+
+        # === HLAVNÝ OBSAH (napravo od loga) ===
+        content_frame = tk.Frame(self.root, bg="#0d0f1a")
+        content_frame.pack(side="left", fill="both", expand=True, padx=(0, 20))
+
+        # 🟢 TU JE DÔLEŽITÉ: `font` je z tkinteru, nie z PIL!
+        # Ak si ho importoval ako `from tkinter import ..., font`, tak je to OK
         title_font = font.Font(family="Segoe UI", size=16, weight="bold")
         label_font = font.Font(family="Segoe UI", size=11)
 
-        # Logo text
         tk.Label(
-            self.root,
-            text="🛡️ Titan Crypt",
+            content_frame,
+            text="🛡️ Titan Crypt Server",
             font=title_font,
             fg="#2e8b57",
             bg="#0d0f1a"
         ).pack(pady=(20, 5))
 
         self.status_label = tk.Label(
-            self.root,
+            content_frame,
             text="Server je zastavený",
             font=("Segoe UI", 11, "bold"),
             fg="#d32f2f",
@@ -1090,7 +1144,7 @@ class ServerGUI:
         self.status_label.pack()
 
         self.port_label = tk.Label(
-            self.root,
+            content_frame,
             text="Port: —",
             font=("Segoe UI", 10),
             fg="#999999",
@@ -1099,7 +1153,7 @@ class ServerGUI:
         self.port_label.pack()
 
         self.btn = tk.Button(
-            self.root,
+            content_frame,
             text="▶️ Spustiť server",
             command=self.toggle_server,
             bg="#2e8b57",
@@ -1115,7 +1169,7 @@ class ServerGUI:
         self.btn.pack(pady=20)
 
         tk.Label(
-            self.root,
+            content_frame,
             text="Po spustení sa automaticky otvorí webový prehliadač",
             font=("Segoe UI", 9),
             fg="#777777",
@@ -1209,7 +1263,7 @@ class ServerGUI:
 
     def on_closing(self):
         if self.server_running:
-            if not messagebox.askyesno("Ukončiť", "Server práve beží.\nNaozaj ukončiť?"):
+            if not messagebox.askyesno("Ukončiť?", "Server práve beží.\nNaozaj to chceš ukončiť?"):
                 return
         self.stop_server()
         self.root.after(300, self.root.destroy)
