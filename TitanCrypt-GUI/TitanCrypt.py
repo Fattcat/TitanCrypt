@@ -681,8 +681,9 @@ INDEX_HTML = """
       <span>!</span>
       <span>Kľúč musí obsahovať presne 25 znakov (A-Z, 0-9)</span>
     </div>
+    <div style="color:red; font-size: 20px;" class="note"><center>!! SKOPÍRUJ KĽÚČ - potrebný pre dešifrovanie !!<center></div>
     <div class="note">Pomlčky sa automaticky vkladajú každých 5 znakov.</div>
-
+    
     <label>Režim spracovania (RAM optimalizácia):</label>
     <div class="speed-radio">
       <label><input type="radio" name="speed_mode" value="high"> High</label>
@@ -830,16 +831,18 @@ function formatKey(input) {
 
 function validateKey(input) {
   const clean = input.value.replace(/-/g, '');
-  const errId = input.id === 'encrypt-key' ? 'key-error' : 'decrypt-key-error';
-  const errEl = document.getElementById(errId);
-  const btn = input.id === 'encrypt-key' ? document.getElementById('encrypt-submit-btn') : document.getElementById('decrypt-submit-btn');
+  const errorId = input.id === 'encrypt-key' ? 'key-error' : 'decrypt-key-error';
+  const errorElement = document.getElementById(errorId);
+  
   if (clean.length !== 25) {
-    errEl.style.display = 'flex';
-    btn.disabled = true;
+    errorElement.style.display = 'flex';
   } else {
-    errEl.style.display = 'none';
-    checkEncryptFormReady(); checkDecryptFormReady();
+    errorElement.style.display = 'none';
   }
+  
+  // ✅ VŽDY zavolaj validáciu formulárov — nech rozhodne kombinácia súbor + kľúč
+  checkEncryptFormReady();
+  checkDecryptFormReady();
 }
 
 function checkEncryptFormReady() {
@@ -1027,7 +1030,12 @@ async function deleteHistoryItem(relPath) {
 document.addEventListener('DOMContentLoaded', function() {
   ['encrypt-key','decrypt-key','text-key','decrypt-text-key'].forEach(id => {
     const el = document.getElementById(id);
-    if (el) el.addEventListener('input', () => formatKey(el));
+    if (el) {
+      el.addEventListener('input', function() {
+        formatKey(this);      // najskôr doplní pomlčky
+        validateKey(this);    // potom validuj → zavolá check...
+      });
+    }
   });
   document.getElementById('encrypt-image')?.addEventListener('change', checkEncryptFormReady);
   document.getElementById('decrypt-image-file')?.addEventListener('change', checkDecryptFormReady);
@@ -1156,14 +1164,31 @@ class ServerGUI:
             bg="#2e8b57",
             fg="white",
             font=("Segoe UI", 11, "bold"),
-            width=22,
+            width=20,
             height=2,
             relief="flat",
             bd=0,
             activebackground="#257a4a",
             activeforeground="white"
         )
-        self.btn.pack(pady=20)
+        self.btn.pack(pady=5)
+
+
+        tk.Label(
+            content_frame,
+            text="Verzia: Lite",
+            font=("Segoe UI", 9),
+            fg="#777777",
+            bg="#0d0f1a"
+        ).pack(side="top", pady=(0,5))
+
+        tk.Label(
+            content_frame,
+            text="Stav aktualizácii: Nedostupné ❌",
+            font=("Segoe UI", 9),
+            fg="#777777",
+            bg="#0d0f1a"
+        ).pack(side="top", pady=(0,5))
 
         tk.Label(
             content_frame,
@@ -1171,9 +1196,13 @@ class ServerGUI:
             font=("Segoe UI", 9),
             fg="#777777",
             bg="#0d0f1a"
-        ).pack(side="bottom", pady=(0,10))
-
+        ).pack(side="bottom", pady=(0,5))
         self.server_running = False
+
+
+
+
+
 
     def toggle_server(self):
         if not self.server_running:
