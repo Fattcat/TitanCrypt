@@ -1,19 +1,25 @@
 import io
 import re
-import random
 import time
 import threading
 import os
 import shutil
-import struct
 import webbrowser
 import sys
 import socket
+import secrets
+import json
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from collections import defaultdict
 import base64
+
+# Moderná kryptografia (nahrádza pôvodné XOR "šifrovanie")
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.exceptions import InvalidTag
+from markupsafe import escape
 
 # Tkinter import (iba ak bežíme ako GUI appka)
 USE_GUI = "--no-gui" not in sys.argv
@@ -38,7 +44,13 @@ MAX_PORT_ATTEMPTS = 10
 
 app = Flask(__name__)
 app.static_folder = str(HISTORY_ROOT / "static")
-app.secret_key = "your-secret-key-here"
+# Náhodný secret_key generovaný pri každom štarte (pôvodne bol natvrdo v kóde = falšovanie session/cookie)
+app.secret_key = secrets.token_hex(32)
+# Obmedzenie veľkosti uploadu (25 MB) - ochrana proti DoS / veľkým súborom
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+
+# Maximálny počet pixelov, ktoré ešte otvoríme cez PIL (ochrana proti "image bomb")
+PIL_MAX_PIXELS = 40_000_000  # cca 40 MPx
 
 # Globálne premenné pre výsledky a server
 _encrypted_image_bytes = None
@@ -110,10 +122,8 @@ def ensure_static_assets():
         if not path.exists():
             try:
                 print(f"[ASSETS] Sťahujem {filename} z GitHubu...")
-                # Obídz SSL overenie (ak je problém s certifikátmi na starších systémoch)
+                # POZOR: overenie SSL certifikátu MUSÍ zostať zapnuté (predtým bolo vypnuté -> MITM riziko)
                 ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
                 with urllib.request.urlopen(url, context=ctx, timeout=10) as response:
                     path.write_bytes(response.read())
                 print(f"[ASSETS] ✅ {filename} uložený.")
@@ -132,10 +142,6 @@ def ensure_static_assets():
                         print(f"[ASSETS] ✅ Vytvorený fallback download.png")
                     except:
                         pass
-
-
-
-
 
 def save_text_history(original_text: str, key: str, encrypted_text: str):
     try:
@@ -170,98 +176,121 @@ def normalize_key_for_storage(raw: str) -> str:
     s = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
     return s[:25]
 
-def xor_encrypt(data: bytes, key: bytes) -> bytes:
-    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
-def create_shuffle_mapping(width, height, seed):
-    total_pixels = width * height
-    indices = list(range(total_pixels))
-    random.seed(seed)
-    random.shuffle(indices)
-    return indices
+# === MODERNÁ KRYPTOGRAFIA (AES-256-GCM + scrypt KDF) ===
+# Pôvodná implementácia používala XOR (reverzibilné len opakovaním kľúča -> triviálne
+# prelomiteľné pri known-plaintext útoku) a pri obrázkoch dokonca iba PREHADZOVALA
+# pixely (Mersenne-Twister PRNG, predvídateľný seed) bez toho, aby menila ich hodnoty -
+# obsah obrázka bol štatisticky rekonštruovateľný z histogramu farieb.
+#
+# Nové riešenie:
+#   - Kľúč odvodený cez scrypt (pomalá KDF, odolná voči brute-force/GPU útokom)
+#     z náhodnej "salt" (uloženej pri šifrovaní).
+#   - Samotné dáta šifrované AES-256-GCM (autentifikované šifrovanie):
+#       * zaisťuje dôvernosť AJ integritu (detekuje akúkoľvek zmenu ciphertextu)
+#       * náhodný nonce pre každé šifrovanie (nikdy sa neopakuje)
+#
+# SCRYPT_N/R/P sú zámerne nižšie ako "odporúčané produkčné" hodnoty, pretože ide
+# o lokálnu desktopovú appku bez online brute-force vektora (server počúva len na
+# 127.0.0.1) - dá sa kedykoľvek sprísniť zvýšením SCRYPT_N.
+SCRYPT_N = 2 ** 14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SALT_LEN = 16
+NONCE_LEN = 12
+AES_KEY_LEN = 32  # AES-256
 
-def apply_shuffle_to_image(img, shuffle_indices):
-    img_rgba = img.convert("RGBA")
-    width, height = img_rgba.size
-    original_pixels = list(img_rgba.getdata())
-    shuffled_pixels = [None] * len(original_pixels)
-    for new_pos, original_pos in enumerate(shuffle_indices):
-        shuffled_pixels[new_pos] = original_pixels[original_pos]
-    shuffled_img = Image.new("RGBA", (width, height))
-    shuffled_img.putdata(shuffled_pixels)
-    return shuffled_img
 
-def restore_original_image(shuffled_img, shuffle_indices):
-    shuffled_img_rgba = shuffled_img.convert("RGBA")
-    width, height = shuffled_img_rgba.size
-    shuffled_pixels = list(shuffled_img_rgba.getdata())
-    inverse_mapping = [0] * len(shuffle_indices)
-    for new_pos, original_pos in enumerate(shuffle_indices):
-        inverse_mapping[original_pos] = new_pos
-    original_pixels = [None] * len(shuffled_pixels)
-    for original_pos in range(len(original_pixels)):
-        new_pos = inverse_mapping[original_pos]
-        original_pixels[original_pos] = shuffled_pixels[new_pos]
-    original_img = Image.new("RGBA", (width, height))
-    original_img.putdata(original_pixels)
-    return original_img
+def derive_key(password: str, salt: bytes, length: int = AES_KEY_LEN) -> bytes:
+    """Odvodí kryptografický kľúč z používateľského hesla pomocou scrypt."""
+    kdf = Scrypt(salt=salt, length=length, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
+    return kdf.derive(password.encode("utf-8"))
 
-def encode_image_to_files(img: Image.Image, key: str) -> (bytes, bytes):
-    img_rgba = img.convert("RGBA")
-    width, height = img_rgba.size
-    seed = sum(ord(c) for c in key) % (2**32)
-    shuffle_indices = create_shuffle_mapping(width, height, seed)
-    shuffled_img = apply_shuffle_to_image(img, shuffle_indices)
-    img_buffer = io.BytesIO()
-    shuffled_img.save(img_buffer, format="PNG")
-    shuffled_img_bytes = img_buffer.getvalue()
-    key_bytes = struct.pack("!III", width, height, seed)
-    user_key_bytes = key.encode('utf-8')
-    encrypted_key_bytes = xor_encrypt(key_bytes, user_key_bytes[:12])
-    return shuffled_img_bytes, encrypted_key_bytes
 
-def decode_files_to_image(shuffled_img_bytes: bytes, encrypted_key_bytes: bytes, user_key: str):
-    user_key_bytes = user_key.encode('utf-8')
-    decrypted_key_bytes = xor_encrypt(encrypted_key_bytes, user_key_bytes[:12])
+def encode_image_to_files(file_bytes: bytes, key: str) -> (bytes, bytes):
+    """
+    Zašifruje pôvodné bajty súboru obrázka pomocou AES-256-GCM.
+    Vracia (encrypted_image_bytes, key_file_bytes):
+      - encrypted_image_bytes = nonce (12B) + ciphertext (vrátane GCM tagu)
+      - key_file_bytes        = salt (16B) použitá pre scrypt
+    Bez správneho hesla NIE JE možné zo salt/nonce/ciphertextu nič odvodiť.
+    """
+    salt = secrets.token_bytes(SALT_LEN)
+    nonce = secrets.token_bytes(NONCE_LEN)
+    aes_key = derive_key(key, salt)
+    aesgcm = AESGCM(aes_key)
+    ciphertext = aesgcm.encrypt(nonce, file_bytes, None)
+    encrypted_image_bytes = nonce + ciphertext
+    key_file_bytes = salt
+    return encrypted_image_bytes, key_file_bytes
+
+
+def decode_files_to_image(encrypted_image_bytes: bytes, key_file_bytes: bytes, user_key: str):
+    """
+    Dešifruje AES-256-GCM ciphertext späť na pôvodné bajty obrázka.
+    Nesprávny kľúč / poškodený súbor -> InvalidTag (autentifikácia zlyhá), nie tiché
+    poškodenie dát ako pri pôvodnom XOR variante.
+    """
+    if len(key_file_bytes) != SALT_LEN:
+        raise ValueError("Neplatný súbor s kľúčom (zlá dĺžka salt)")
+    if len(encrypted_image_bytes) < NONCE_LEN:
+        raise ValueError("Neplatný zašifrovaný súbor")
+
+    salt = key_file_bytes
+    nonce = encrypted_image_bytes[:NONCE_LEN]
+    ciphertext = encrypted_image_bytes[NONCE_LEN:]
+    aes_key = derive_key(user_key, salt)
+    aesgcm = AESGCM(aes_key)
     try:
-        width, height, seed = struct.unpack("!III", decrypted_key_bytes)
-    except Exception as e:
-        raise ValueError(f"Neplatný kľúč: {e}")
-    shuffle_indices = create_shuffle_mapping(width, height, seed)
-    shuffled_img = Image.open(io.BytesIO(shuffled_img_bytes)).convert("RGBA")
-    if shuffled_img.size != (width, height):
-        raise ValueError("Nezhodujú sa rozmery")
-    if len(shuffle_indices) != width * height:
-        raise ValueError("Nezhoduje sa počet pixelov")
-    original_img = restore_original_image(shuffled_img, shuffle_indices)
+        original_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+    except InvalidTag:
+        raise ValueError("Nesprávny kľúč alebo poškodený/pozmenený súbor")
+
+    if len(original_bytes) > PIL_MAX_PIXELS:  # hrubá ochrana pred extrémne veľkými dátami
+        raise ValueError("Dešifrovaný obsah je neprimerane veľký")
+
+    original_img = Image.open(io.BytesIO(original_bytes))
+    original_img.load()
+    width, height = original_img.size
     return original_img, width, height
 
+
 def text_encrypt(plain_text: str, key: str) -> str:
-    if not plain_text or not key: return ""
-    text_bytes = plain_text.encode('utf-8')
-    key_bytes = key.encode('utf-8')
-    encrypted_bytes = xor_encrypt(text_bytes, key_bytes)
-    hex_string = encrypted_bytes.hex()
-    original_byte_length = len(text_bytes)
-    length_hex = f"{original_byte_length:04x}"
-    return length_hex + hex_string
+    """AES-256-GCM šifrovanie textu. Výstup: hex(salt) + hex(nonce) + hex(ciphertext+tag)."""
+    if not plain_text or not key:
+        return ""
+    salt = secrets.token_bytes(SALT_LEN)
+    nonce = secrets.token_bytes(NONCE_LEN)
+    aes_key = derive_key(key, salt)
+    aesgcm = AESGCM(aes_key)
+    ciphertext = aesgcm.encrypt(nonce, plain_text.encode("utf-8"), None)
+    return (salt + nonce + ciphertext).hex()
+
 
 def text_decrypt(encrypted_text: str, key: str) -> str:
-    if not encrypted_text or not key: return ""
+    """Opačný krok k text_encrypt. GCM tag zaručí, že pri zlom kľúči/pozmenenom
+    texte dostaneme jasnú chybu namiesto ticho poškodeného výstupu."""
+    if not encrypted_text or not key:
+        return ""
     try:
-        if not re.match(r'^[0-9a-fA-F]+$', encrypted_text): raise ValueError("Neplatný hex")
-        if len(encrypted_text) < 4: raise ValueError("Chýba dĺžka")
-        length_hex = encrypted_text[:4]
-        original_byte_length = int(length_hex, 16)
-        encrypted_hex = encrypted_text[4:]
-        encrypted_bytes = bytes.fromhex(encrypted_hex)
-        if len(encrypted_bytes) > original_byte_length:
-            encrypted_bytes = encrypted_bytes[:original_byte_length]
-        elif len(encrypted_bytes) < original_byte_length:
-            encrypted_bytes = encrypted_bytes.ljust(original_byte_length, b'\x00')
-        key_bytes = key.encode('utf-8')
-        decrypted_bytes = xor_encrypt(encrypted_bytes, key_bytes)
-        return decrypted_bytes.decode('utf-8')
+        if not re.match(r'^[0-9a-fA-F]+$', encrypted_text):
+            raise ValueError("Neplatný hex reťazec")
+        raw = bytes.fromhex(encrypted_text)
+        min_len = SALT_LEN + NONCE_LEN
+        if len(raw) <= min_len:
+            raise ValueError("Zašifrovaný text je príliš krátky / neplatný")
+        salt = raw[:SALT_LEN]
+        nonce = raw[SALT_LEN:min_len]
+        ciphertext = raw[min_len:]
+        aes_key = derive_key(key, salt)
+        aesgcm = AESGCM(aes_key)
+        try:
+            decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+        except InvalidTag:
+            raise ValueError("Nesprávny kľúč alebo pozmenený text")
+        return decrypted_bytes.decode("utf-8")
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"Dešifrovanie zlyhalo: {e}")
 
@@ -286,11 +315,17 @@ def encrypt_task(task_id, file_bytes, key_raw, mode="medium", original_filename=
         if len(key_clean) != 25:
             task_status[task_id]["error"] = "Kľúč: presne 25 znakov (A–Z, 0–9)"
             return
+        # Over, že ide skutočne o obrázok, a ochráň sa pred "image bomb" (extrémne rozmery)
         img = Image.open(io.BytesIO(file_bytes))
+        img.verify()
+        img = Image.open(io.BytesIO(file_bytes))
+        if img.size[0] * img.size[1] > PIL_MAX_PIXELS:
+            task_status[task_id]["error"] = "Obrázok je príliš veľký"
+            return
         if not simulate_progress_with_mode(task_id, total_steps=80, mode=mode):
             task_status[task_id]["error"] = "Zrušené"
             return
-        encrypted_img_bytes, decryption_key_bytes = encode_image_to_files(img, key_clean)
+        encrypted_img_bytes, decryption_key_bytes = encode_image_to_files(file_bytes, key_clean)
         global _encrypted_image_bytes, _decryption_key_bytes
         _encrypted_image_bytes = encrypted_img_bytes
         _decryption_key_bytes = decryption_key_bytes
@@ -320,6 +355,30 @@ def decrypt_task(task_id, image_bytes, key_bytes, user_key, mode="medium"):
         task_status[task_id]["result"] = "decrypt_success"
     except Exception as e:
         task_status[task_id]["error"] = f"Chyba: {str(e)}"
+
+
+# === CSRF / DRIVE-BY OCHRANA ===
+# Server počúva len na 127.0.0.1, ale to NEBRÁNI škodlivej stránke otvorenej v tom
+# istom prehliadači poslať fetch/POST na http://127.0.0.1:PORT/... (tzv. localhost
+# CSRF / drive-by útok). Pôvodný kód takéto požiadavky vôbec nefiltroval, takže
+# /shutdown aj /history/delete/... šlo spustiť z ľubovoľnej webstránky.
+STATE_CHANGING_PATHS = {
+    "/start_encrypt", "/start_decrypt", "/text_encrypt", "/text_decrypt",
+    "/shutdown",
+}
+
+@app.before_request
+def _csrf_origin_guard():
+    if request.method != "POST":
+        return None
+    if not (request.path in STATE_CHANGING_PATHS or request.path.startswith("/history/delete/")
+            or request.path.startswith("/cancel_task/")):
+        return None
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    allowed_prefixes = (f"http://{HOST}:", f"https://{HOST}:")
+    if origin and not origin.startswith(allowed_prefixes):
+        return jsonify({"error": "Zakázaný pôvod požiadavky (CSRF ochrana)"}), 403
+    return None
 
 
 # === FLASK ROUTES ===
@@ -425,7 +484,8 @@ def text_encrypt_route():
         save_text_history(plain_text, key_clean, encrypted_text)
         return render_template_string(INDEX_HTML, encrypted_text=encrypted_text, original_length=_original_text_length, encrypted_length=_encrypted_text_length)
     except Exception as e:
-        return f"<script>alert('Chyba: {e}'); window.history.back();</script>"
+        # json.dumps bezpečne escapuje uvodzovky/</script> a pod. -> zabraňuje reflected XSS
+        return f"<script>alert({json.dumps('Chyba: ' + str(e))}); window.history.back();</script>"
 
 @app.route("/text_decrypt", methods=["POST"])
 def text_decrypt_route():
@@ -443,7 +503,7 @@ def text_decrypt_route():
         _decrypted_text = decrypted_text
         return render_template_string(INDEX_HTML, decrypted_text=decrypted_text)
     except Exception as e:
-        return f"<script>alert('Chyba: {e}'); window.history.back();</script>"
+        return f"<script>alert({json.dumps('Chyba: ' + str(e))}); window.history.back();</script>"
 
 @app.route("/history/list")
 def history_list():
@@ -466,8 +526,17 @@ def history_list():
 
 @app.route("/history/delete/<path:rel_path>", methods=["POST"])
 def history_delete(rel_path):
-    full_path = HISTORY_ROOT / rel_path
+    # PÔVODNÝ KÓD tu mal path traversal: "../../../ľubovoľný/priečinok" by sa dal
+    # zmazať cez shutil.rmtree, keďže rel_path sa nikde neoveroval. Teraz striktne
+    # vyžadujeme presne tvar "TextCrypt/Encrypted_..." alebo "ImgCrypt/Encrypted_...",
+    # a navyše overíme, že výsledná cesta reálne leží pod HISTORY_ROOT.
+    if not re.fullmatch(r"(TextCrypt|ImgCrypt)/Encrypted_[0-9A-Za-z_]+", rel_path):
+        return jsonify({"error": "Neplatná cesta"}), 400
     try:
+        history_root_resolved = HISTORY_ROOT.resolve()
+        full_path = (HISTORY_ROOT / rel_path).resolve()
+        if history_root_resolved not in full_path.parents:
+            return jsonify({"error": "Neplatná cesta"}), 400
         if full_path.is_dir():
             shutil.rmtree(full_path)
             return jsonify({"status": "ok"})
@@ -696,7 +765,7 @@ INDEX_HTML = """
 
 <!-- Logo (inline SVG – žiadne externé) -->
 <div style="text-align: center; margin-bottom: 24px;">
-  <img src="https://github.com/Fattcat/TitanCrypt/raw/main/Win11-App/static/TitanCryptLogo2.png"
+  <img src="static/TitanCryptLogo2.png"
       alt="Titan Crypt Logo"
       width="128"
       height="128"
@@ -916,16 +985,25 @@ function checkDecryptFormReady() {
   btn.disabled = !(i && k && key.length === 25);
 }
 
-function generateRandomKey() {
+// Math.random() nie je kryptograficky bezpečný PRNG (predvídateľný stav) -> pre
+// generovanie šifrovacích kľúčov použijeme crypto.getRandomValues().
+function secureRandomKeyString(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let r = ''; for (let i=0; i<25; i++) r += chars[Math.floor(Math.random()*chars.length)];
+  const bytes = new Uint32Array(length);
+  crypto.getRandomValues(bytes);
+  let r = '';
+  for (let i = 0; i < length; i++) r += chars[bytes[i] % chars.length];
+  return r;
+}
+
+function generateRandomKey() {
+  const r = secureRandomKeyString(25);
   document.getElementById('encrypt-key').value = r.match(/.{1,5}/g).join('-');
   validateKey(document.getElementById('encrypt-key'));
 }
 
 function generateTextRandomKey() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let r = ''; for (let i=0; i<25; i++) r += chars[Math.floor(Math.random()*chars.length)];
+  const r = secureRandomKeyString(25);
   document.getElementById('text-key').value = r.match(/.{1,5}/g).join('-');
   document.getElementById('text-key').dispatchEvent(new Event('input'));
 }
@@ -1372,4 +1450,8 @@ if __name__ == "__main__":
         # Vývojársky režim
         port = find_free_port(DEFAULT_PORT, MAX_PORT_ATTEMPTS)
         print(f"[DEV] Spúšťam priamo na http://{HOST}:{port}")
-        app.run(host=HOST, port=port, debug=True)
+        # POZOR: debug=True bolo v pôvodnom kóde zapnuté aj mimo vývoja - Werkzeug
+        # debugger v tomto móde umožňuje vzdialené spustenie ľubovoľného Python kódu
+        # (RCE), ak sa niekto dostane na endpoint s neošetrenou výnimkou. Necháme
+        # vypnuté; zapni len ručne a lokálne, ak naozaj ladíš appku.
+        app.run(host=HOST, port=port, debug=False)
